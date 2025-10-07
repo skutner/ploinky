@@ -7,16 +7,14 @@ import { spawn } from 'node:child_process';
 // AgentServer (MCP over HTTP): exposes tools/resources via Streamable HTTP transport on PORT (default 7000) at /mcp.
 
 async function loadSdkDeps() {
-  const mcp = await import('@modelcontextprotocol/sdk/server/mcp.js');
-  const streamHttp = await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
-  const types = await import('@modelcontextprotocol/sdk/types.js');
+  const { server, types, streamableHttp } = await import('mcp-sdk');
   return {
-    McpServer: mcp.McpServer,
-    ResourceTemplate: mcp.ResourceTemplate,
-    StreamableHTTPServerTransport: streamHttp.StreamableHTTPServerTransport,
+    McpServer: server.McpServer,
+    ResourceTemplate: server.ResourceTemplate,
+    StreamableHTTPServerTransport: streamableHttp.StreamableHTTPServerTransport,
     isInitializeRequest: types.isInitializeRequest,
-    McpError: mcp.McpError,
-    ErrorCode: mcp.ErrorCode
+    McpError: types.McpError,
+    ErrorCode: types.ErrorCode
   };
 }
 
