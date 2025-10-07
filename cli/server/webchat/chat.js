@@ -13,6 +13,7 @@
   const banner = document.getElementById('connBanner');
   const bannerText = document.getElementById('bannerText');
   const chatList = document.getElementById('chatList');
+  const typingIndicator = document.getElementById('typingIndicator');
   const cmdInput = document.getElementById('cmd');
   const sendBtn = document.getElementById('send');
   const chatContainer = document.getElementById('chatContainer');
@@ -22,6 +23,7 @@
   const sidePanelClose = document.getElementById('sidePanelClose');
   const sidePanelTitle = document.querySelector('.wa-side-panel-title');
   const sidePanelResizer = document.getElementById('sidePanelResizer');
+  const viewMoreLinesInput = document.getElementById('viewMoreLines');
 
   // --- State ---
   const requiresAuth = body.dataset.auth === 'true';
@@ -29,6 +31,42 @@
   let activeSidePanelBubble = null;
   let userInputSent = false;
   let lastClientCommand = '';
+  const VIEW_MORE_LINES_KEY = 'wa_view_more_lines';
+  const LEGACY_VIEW_MORE_KEY = 'wa_view_more_enabled';
+  let viewMoreLineLimit = 1000;
+  let typingActive = false;
+  let sttActive = false;
+  const sendTriggerRe = /\bsend\b/i;
+  const purgeTriggerRe = /\bpurge\b/i;
+
+  function appendMessageEl(node) {
+    if (!node || !chatList) return;
+    try {
+      if (typingIndicator && typingIndicator.parentNode === chatList) {
+        chatList.insertBefore(node, typingIndicator);
+      } else {
+        chatList.appendChild(node);
+      }
+    } catch (_) {
+      try { chatList.appendChild(node); } catch (__) {}
+    }
+  }
+
+  function showTypingIndicator() {
+    if (!typingIndicator) return;
+    typingActive = true;
+    typingIndicator.classList.add('show');
+    typingIndicator.setAttribute('aria-hidden', 'false');
+    try { chatList.scrollTop = chatList.scrollHeight; } catch (_) {}
+  }
+
+  function hideTypingIndicator(force) {
+    if (!typingIndicator) return;
+    if (!typingActive && !force) return;
+    typingActive = false;
+    typingIndicator.classList.remove('show');
+    typingIndicator.setAttribute('aria-hidden', 'true');
+  }
 
   // --- Basic Setup ---
   const appTitle = (body.dataset.title || body.dataset.agent || 'Chat').trim() || 'Chat';
@@ -53,7 +91,41 @@
   themeToggle.onclick = () => { setTheme(getTheme() === 'dark' ? 'light' : 'dark'); };
   setTheme(getTheme());
 
-  (async () => { if (requiresAuth && !(await fetch('whoami').then(r => r.ok).catch(()=>false))) location.href = '.'; })();
+  try {
+    const storedLimit = localStorage.getItem(VIEW_MORE_LINES_KEY);
+    if (storedLimit !== null) {
+      const parsed = parseInt(storedLimit, 10);
+      if (!Number.isNaN(parsed) && parsed >= 1) {
+        viewMoreLineLimit = parsed;
+      }
+    } else {
+      const legacy = localStorage.getItem(LEGACY_VIEW_MORE_KEY);
+      if (legacy === 'true') viewMoreLineLimit = 6;
+      else if (legacy === 'false') viewMoreLineLimit = 1000;
+    }
+    localStorage.removeItem(LEGACY_VIEW_MORE_KEY);
+    localStorage.setItem(VIEW_MORE_LINES_KEY, String(viewMoreLineLimit));
+  } catch (_) { viewMoreLineLimit = 1000; }
+  if (viewMoreLinesInput) {
+    const normalizeLineLimit = () => {
+      const parsed = parseInt(viewMoreLinesInput.value, 10);
+      viewMoreLineLimit = Number.isNaN(parsed) ? 1 : Math.max(1, parsed);
+      viewMoreLinesInput.value = String(viewMoreLineLimit);
+      try { localStorage.setItem(VIEW_MORE_LINES_KEY, String(viewMoreLineLimit)); } catch (_) {}
+      applyViewMoreSettingToAllBubbles();
+    };
+    viewMoreLinesInput.value = String(viewMoreLineLimit);
+    viewMoreLinesInput.addEventListener('change', normalizeLineLimit);
+    viewMoreLinesInput.addEventListener('blur', normalizeLineLimit);
+  }
+
+  const basePath = (document.body.dataset.base || '').replace(/\/$/, '') || '';
+  const toEndpoint = (path) => {
+    const suffix = String(path || '').replace(/^\/+/, '');
+    return basePath ? `${basePath}/${suffix}` : `/${suffix}`;
+  };
+
+  (async () => { if (requiresAuth && !(await fetch(toEndpoint('whoami')).then(r => r.ok).catch(()=>false))) location.href = basePath || '.'; })();
 
   // --- Side Panel Logic ---
   function getPanelWrapper() { return document.querySelector('.wa-side-panel-content'); }
@@ -127,10 +199,19 @@
     wrap.innerHTML = '<div id="sidePanelContent" class="wa-side-panel-body"></div>';
     const el = document.getElementById('sidePanelContent');
     if (el) {
-      el.innerHTML = markdown ? markdown.render(text) : text;
+      if (markdown && typeof markdown.render === 'function') {
+        try {
+          el.innerHTML = markdown.render(text);
+        } catch (e) {
+          console.error('[webchat] Markdown render error:', e);
+          el.innerHTML = text;
+        }
+      } else {
+        el.innerHTML = text;
+      }
       bindLinkDelegation(el);
     }
-    setPanelTitleText('Full Answear');
+    setPanelTitleText('Full Answer');
     sidePanel.style.display = 'flex';
     chatContainer.classList.add('side-panel-open');
   }
@@ -278,8 +359,26 @@
       cmdInput.style.height = next + 'px';
     } catch (_) {} // Ignore errors during auto-resize
   }
+
+  function clearComposer() {
+    cmdInput.value = '';
+    autoResize();
+  }
+
+  function purgeComposer(options = {}) {
+    const { resetVoice = false } = options;
+    clearComposer();
+    if (resetVoice || sttActive) {
+      try { resetTranscriptState(); } catch (_) {}
+    }
+  }
   setTimeout(autoResize, 0);
-  cmdInput.addEventListener('input', autoResize);
+  cmdInput.addEventListener('input', () => {
+    autoResize();
+    if (purgeTriggerRe.test(cmdInput.value)) {
+      purgeComposer();
+    }
+  });
 
   function formatTime() {
     const d = new Date();
@@ -301,36 +400,64 @@
     const textDiv = msgDiv.querySelector('.wa-message-text');
     textDiv.innerHTML = markdown ? markdown.render(text) : text;
     bindLinkDelegation(textDiv);
-    chatList.appendChild(msgDiv);
+    appendMessageEl(msgDiv);
     chatList.scrollTop = chatList.scrollHeight;
     lastServerMsg.bubble = null; // Reset server message grouping
   }
 
   function updateBubbleContent(bubble, fullText) {
-    const lines = (fullText || '').split('\n');
-    const preview = lines.slice(0, 6).join('\n');
-    const hasMore = lines.length > 6;
+    const safeText = typeof fullText === 'string' ? fullText : '';
+    bubble.dataset.fullText = safeText;
+    const lines = safeText.split('\n');
+    const limit = typeof viewMoreLineLimit === 'number' && viewMoreLineLimit >= 1 ? viewMoreLineLimit : 1;
+    const allowCollapse = lines.length > limit;
+    const displayText = allowCollapse ? lines.slice(0, limit).join('\n') : safeText;
 
     const textDiv = bubble.querySelector('.wa-message-text');
     const moreDiv = bubble.querySelector('.wa-message-more');
 
-    textDiv.innerHTML = markdown ? markdown.render(preview) : preview;
+    textDiv.innerHTML = markdown ? markdown.render(displayText) : displayText;
     bindLinkDelegation(textDiv);
 
-    if (hasMore && !moreDiv) {
+    if (allowCollapse && !moreDiv) {
       const more = document.createElement('div');
       more.className = 'wa-message-more';
       more.textContent = 'View more';
-      more.onclick = () => openSidePanel(bubble, fullText);
+      more.onclick = () => openSidePanel(bubble, safeText);
       bubble.appendChild(more);
-    } else if (hasMore && moreDiv) {
-      moreDiv.onclick = () => openSidePanel(bubble, fullText);
+    } else if (allowCollapse && moreDiv) {
+      moreDiv.onclick = () => openSidePanel(bubble, safeText);
+    } else if (!allowCollapse && moreDiv) {
+      moreDiv.remove();
     }
 
-    if (activeSidePanelBubble === bubble) {
-      const el = document.getElementById('sidePanelContent');
-      if (el) el.innerHTML = markdown ? markdown.render(fullText) : fullText;
+    if (allowCollapse) {
+      if (activeSidePanelBubble === bubble) {
+        const el = document.getElementById('sidePanelContent');
+        if (el && markdown && typeof markdown.render === 'function') {
+          try {
+            el.innerHTML = markdown.render(safeText);
+          } catch (e) {
+            console.error('[webchat] Markdown render error in bubble update:', e);
+            el.innerHTML = safeText;
+          }
+        } else if (el) {
+          el.innerHTML = safeText;
+        }
+      }
+    } else if (activeSidePanelBubble === bubble) {
+      closeSidePanel();
     }
+  }
+
+  function applyViewMoreSettingToAllBubbles() {
+    const bubbles = chatList?.querySelectorAll('.wa-message-bubble') || [];
+    bubbles.forEach((bubble) => {
+      const text = bubble.dataset?.fullText;
+      if (typeof text === 'string') {
+        updateBubbleContent(bubble, text);
+      }
+    });
   }
 
   function addServerMsg(text) {
@@ -373,7 +500,7 @@
 
       updateBubbleContent(bubble, text);
       bubble.querySelector('.wa-message-time').textContent = formatTime();
-      chatList.appendChild(msgDiv);
+      appendMessageEl(msgDiv);
     }
     chatList.scrollTop = chatList.scrollHeight;
   }
@@ -390,11 +517,9 @@
   const sttSupported = typeof SpeechRecognitionClass === 'function';
   const sttLangKey = 'vc_stt_lang';
   const sttEnabledKey = 'vc_stt_enabled';
-  const sendTriggerRe = /\bsend\b/i;
 
   let sttRecognition = null;
   let sttListening = false;
-  let sttActive = false;
   let sttLangCode = localStorage.getItem(sttLangKey) || 'en-GB';
   let finalSegments = [];
   let interimTranscript = '';
@@ -407,6 +532,7 @@
   function setMicVisual(active) {
     if (!sttBtn) return;
     sttBtn.classList.toggle('active', active);
+    sttBtn.classList.toggle('muted', !active);
     sttBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
   }
 
@@ -444,6 +570,9 @@
     }
     cmdInput.scrollTop = prevScroll;
     autoResize();
+    if (purgeTriggerRe.test(cmdInput.value)) {
+      purgeComposer({ resetVoice: true });
+    }
   }
 
   function updateComposerFromVoice() {
@@ -465,10 +594,13 @@
     autoResize();
     if (cleaned) sendCmd();
     else {
-      cmdInput.value = '';
-      autoResize();
+      clearComposer();
     }
     resetTranscriptState();
+  }
+
+  function handleVoicePurge() {
+    purgeComposer({ resetVoice: true });
   }
 
   function stopRecognition() {
@@ -510,6 +642,11 @@
           if (res.isFinal) {
             finalSegments.push(transcript);
             const joined = finalSegments.join(' ');
+            if (purgeTriggerRe.test(joined)) {
+              triggered = true;
+              handleVoicePurge();
+              break;
+            }
             if (sendTriggerRe.test(joined)) {
               triggered = true;
               handleVoiceSend(joined);
@@ -675,7 +812,10 @@
 
   if (!sttSupported) {
     updateVoiceStatus('Unsupported');
-    if (sttBtn) sttBtn.disabled = true;
+    if (sttBtn) {
+      sttBtn.disabled = true;
+      setMicVisual(false);
+    }
   } else if (sttEnable) {
     if (sttEnable.checked) {
       sttActive = true;
@@ -694,16 +834,20 @@
   function sendCmd() {
     const cmd = cmdInput.value.trim();
     if (!cmd) return;
+    if (purgeTriggerRe.test(cmd)) {
+      purgeComposer();
+      return;
+    }
     addClientMsg(cmd);
     userInputSent = true;
-    cmdInput.value = '';
-    autoResize();
-    fetch(`input?tabId=${TAB_ID}`, {
+    clearComposer();
+    fetch(toEndpoint(`input?tabId=${TAB_ID}`), {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       body: cmd + '\n'
     }).catch((e) => {
       dlog('chat error', e);
+      hideTypingIndicator(true);
       addServerMsg('[input error]');
       showBanner('Chat error', 'err');
     });
@@ -728,12 +872,58 @@
     } catch (_) { return s; }
   }
 
+  const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
+
+  function isProcessingChunk(text) {
+    if (!text) return false;
+    const trimmed = text.replace(/\s/g, '');
+    if (trimmed.length === 0 || !/^[.·…]+$/.test(trimmed)) return false;
+    const hasWhitespace = /\s/.test(text);
+    return hasWhitespace || trimmed.length > 3;
+  }
+
+  function stripProcessingPrefix(text) {
+    if (!text) return text;
+    const match = PROCESS_PREFIX_RE.exec(text);
+    if (!match) return text;
+    if (match[0].length >= text.length) return '';
+    return text.slice(match[0].length);
+  }
+
+  function handleServerChunk(raw) {
+    if (raw === undefined || raw === null) return;
+    let text = String(raw);
+    if (!text) return;
+
+    if (isProcessingChunk(text)) {
+      showTypingIndicator();
+      return;
+    }
+
+    const stripped = stripProcessingPrefix(text);
+    if (stripped !== text) showTypingIndicator();
+
+    if (!stripped.trim()) {
+      return;
+    }
+
+    hideTypingIndicator();
+    addServerMsg(stripped);
+  }
+
   function pushSrvFromBuffer() {
     if (!chatBuffer) return;
     const parts = chatBuffer.split(/\r?\n/);
-    chatBuffer = parts.pop() || '';
-    const blocks = parts.map(stripCtrlAndAnsi).join('\n');
-    if (blocks) addServerMsg(blocks);
+    chatBuffer = parts.pop() ?? '';
+    parts.forEach((part) => {
+      const clean = stripCtrlAndAnsi(part);
+      handleServerChunk(clean);
+    });
+
+    const tailClean = stripCtrlAndAnsi(chatBuffer);
+    if (isProcessingChunk(tailClean)) {
+      showTypingIndicator();
+    }
   }
 
   function startSSE() {
@@ -741,9 +931,10 @@
     showBanner('Connecting…');
     try { es?.close?.(); } catch (_) {}
 
-    es = new EventSource(`stream?tabId=${TAB_ID}`);
+    es = new EventSource(toEndpoint(`stream?tabId=${TAB_ID}`));
 
     es.onopen = () => {
+      hideTypingIndicator(true);
       statusEl.textContent = 'online';
       statusDot.classList.remove('offline');
       statusDot.classList.add('online');
@@ -752,6 +943,7 @@
     };
 
     es.onerror = (e) => {
+      hideTypingIndicator(true);
       statusEl.textContent = 'offline';
       statusDot.classList.remove('online');
       statusDot.classList.add('offline');
