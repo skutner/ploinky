@@ -3,7 +3,7 @@ import FlexSearch from 'flexsearch';
 import {
     createFlexSearchAdapter,
     fromFlexSearchInstance,
-} from 'ploinky-agent-lib/search/flexsearchAdapter.mjs';
+} from './helpers/flexsearchAdapter.mjs';
 
 const docs = [
     { id: 'doc-1', text: 'FlexSearch adapter basics and quick usage notes.' },

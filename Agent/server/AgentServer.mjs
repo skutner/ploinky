@@ -3,15 +3,16 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { z } from 'zod';
 
 // AgentServer (MCP over HTTP): exposes tools/resources via Streamable HTTP transport on PORT (default 7000) at /mcp.
 
 async function loadSdkDeps() {
-  const { server, types, streamableHttp } = await import('mcp-sdk');
+  const { types,  streamHttp, mcp } = await import('mcp-sdk');
   return {
-    McpServer: server.McpServer,
-    ResourceTemplate: server.ResourceTemplate,
-    StreamableHTTPServerTransport: streamableHttp.StreamableHTTPServerTransport,
+    McpServer: mcp.McpServer,
+    ResourceTemplate: mcp.ResourceTemplate,
+    StreamableHTTPServerTransport:  streamHttp.StreamableHTTPServerTransport,
     isInitializeRequest: types.isInitializeRequest,
     McpError: types.McpError,
     ErrorCode: types.ErrorCode
@@ -64,6 +65,117 @@ function buildCommandSpec(entry, defaultCwd) {
   return { command, cwd, env, timeoutMs };
 }
 
+function createLiteralUnionSchema(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return null;
+  }
+  const unique = [...new Set(values)];
+  if (unique.length === 1) {
+    return z.literal(unique[0]);
+  }
+  return z.union(unique.map(value => z.literal(value)));
+}
+
+function buildZodObjectSchema(spec) {
+  if (!spec || typeof spec !== 'object') {
+    return null;
+  }
+  const shape = {};
+  let hasFields = false;
+  for (const [key, fieldSpec] of Object.entries(spec)) {
+    shape[key] = createFieldSchema(fieldSpec);
+    hasFields = true;
+  }
+  if (!hasFields) {
+    return z.object({});
+  }
+  return z.object(shape);
+}
+
+function createFieldSchema(fieldSpec) {
+  if (typeof fieldSpec === 'string') {
+    fieldSpec = { type: fieldSpec };
+  }
+  if (!fieldSpec || typeof fieldSpec !== 'object') {
+    return z.any();
+  }
+  const type = typeof fieldSpec.type === 'string' ? fieldSpec.type.toLowerCase() : 'string';
+  let schema;
+  switch (type) {
+    case 'string': {
+      if (Array.isArray(fieldSpec.enum) && fieldSpec.enum.every(value => typeof value === 'string')) {
+        schema = createLiteralUnionSchema(fieldSpec.enum) || z.string();
+      } else {
+        schema = z.string();
+      }
+      if (typeof fieldSpec.minLength === 'number') {
+        schema = schema.min(fieldSpec.minLength);
+      }
+      if (typeof fieldSpec.maxLength === 'number') {
+        schema = schema.max(fieldSpec.maxLength);
+      }
+      break;
+    }
+    case 'number': {
+      schema = z.number();
+      if (typeof fieldSpec.min === 'number') {
+        schema = schema.min(fieldSpec.min);
+      }
+      if (typeof fieldSpec.max === 'number') {
+        schema = schema.max(fieldSpec.max);
+      }
+      if (Array.isArray(fieldSpec.enum) && fieldSpec.enum.every(value => typeof value === 'number')) {
+        schema = createLiteralUnionSchema(fieldSpec.enum) || schema;
+      }
+      break;
+    }
+    case 'boolean':
+      schema = z.boolean();
+      break;
+    case 'array': {
+      const itemSchema = createFieldSchema(fieldSpec.items ?? { type: 'string' });
+      schema = z.array(itemSchema);
+      if (typeof fieldSpec.minItems === 'number') {
+        schema = schema.min(fieldSpec.minItems);
+      }
+      if (typeof fieldSpec.maxItems === 'number') {
+        schema = schema.max(fieldSpec.maxItems);
+      }
+      break;
+    }
+    case 'object': {
+      const nested = buildZodObjectSchema(fieldSpec.properties) || z.object({});
+      schema = fieldSpec.additionalProperties === true ? nested.passthrough() : nested;
+      break;
+    }
+    default:
+      schema = z.any();
+      break;
+  }
+
+  if (!schema) {
+    schema = z.any();
+  }
+
+  if (Array.isArray(fieldSpec.enum) && !['string', 'number'].includes(type)) {
+    const enumSchema = createLiteralUnionSchema(fieldSpec.enum);
+    if (enumSchema) {
+      schema = enumSchema;
+    }
+  }
+
+  if (fieldSpec.nullable) {
+    schema = schema.nullable();
+  }
+  if (fieldSpec.optional) {
+    schema = schema.optional();
+  }
+  if (typeof fieldSpec.description === 'string' && schema.describe) {
+    schema = schema.describe(fieldSpec.description);
+  }
+  return schema;
+}
+
 function executeShell(spec, payload) {
   return new Promise((resolve, reject) => {
     const { command, cwd, env, timeoutMs } = spec;
@@ -81,6 +193,12 @@ function executeShell(spec, payload) {
     child.stdout.on('data', chunk => stdout.push(chunk));
     child.stderr.on('data', chunk => stderr.push(chunk));
     child.on('error', reject);
+    child.stdin.on('error', err => {
+      if (err?.code === 'EPIPE') {
+        return;
+      }
+      reject(err);
+    });
     child.on('close', (code, signal) => {
       resolve({
         code,
@@ -127,8 +245,17 @@ async function registerFromConfig(server, config, helpers) {
         description: tool.description
       };
 
-      server.registerTool(name, definition, async (args = {}, metadata = {}) => {
-        const payload = { tool: name, input: args, metadata };
+      const invocation = async (...cbArgs) => {
+        let args = cbArgs[0] ?? {};
+        let context = cbArgs[1] ?? {};
+        if (cbArgs.length === 1 && typeof args === 'object' && args !== null && args.requestId) {
+          context = args;
+          args = {};
+        }
+        console.log(`[AgentServer/MCP] Tool '${name}' args:`, args);
+        console.log(`[AgentServer/MCP] Tool '${name}' context:`, context);
+        const payload = { tool: name, input: args, metadata: context };
+        console.log(`[AgentServer/MCP] Tool '${name}' payload:`, JSON.stringify(payload));
         const result = await executeShell(commandSpec, payload);
         if (result.code !== 0) {
           const message = result.stderr?.trim() || `command exited with code ${result.code}`;
@@ -143,7 +270,27 @@ async function registerFromConfig(server, config, helpers) {
           content.push({ type: 'text', text: `stderr:\n${result.stderr}` });
         }
         return { content };
-      });
+      };
+
+      const registeredTool = server.registerTool(name, definition, invocation);
+
+      let configuredSchema = null;
+      if (tool.inputSchema && typeof tool.inputSchema === 'object') {
+        try {
+          configuredSchema = buildZodObjectSchema(tool.inputSchema);
+        } catch (err) {
+          console.error(`[AgentServer/MCP] Failed to build inputSchema for tool '${name}': ${err.message}`);
+        }
+      }
+
+      if (configuredSchema) {
+        registeredTool.inputSchema = configuredSchema;
+        if (typeof server.sendToolListChanged === 'function') {
+          server.sendToolListChanged();
+        }
+      } else if (!registeredTool.inputSchema) {
+        registeredTool.inputSchema = z.object({});
+      }
     }
   }
 
