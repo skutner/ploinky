@@ -164,6 +164,16 @@ function createFieldSchema(fieldSpec) {
     }
   }
 
+  if (fieldSpec.isArray && type !== 'array') {
+    schema = z.array(schema);
+    if (typeof fieldSpec.minItems === 'number') {
+      schema = schema.min(fieldSpec.minItems);
+    }
+    if (typeof fieldSpec.maxItems === 'number') {
+      schema = schema.max(fieldSpec.maxItems);
+    }
+  }
+
   if (fieldSpec.nullable) {
     schema = schema.nullable();
   }
